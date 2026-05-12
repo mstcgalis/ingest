@@ -20,7 +20,7 @@ TAG="v$VERSION"
 sed -i '' "s/^VERSION=.*/VERSION=\"$VERSION\"/" ingest
 
 # commit, tag, push
-git add ingest ingest.config.example LICENSE deploy.sh
+git add ingest ingest.config.example LICENSE deploy.sh README.md
 git commit -m "Release $TAG"
 git tag "$TAG"
 git push && git push --tags
