@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 
 # ── platform ──────────────────────────────────────────────────────────────────
 
@@ -202,14 +202,14 @@ log ""
 # ── helper predicates ─────────────────────────────────────────────────────────
 
 is_raw() {
-  local ext="${1##*.}"; ext="${ext^^}"
+  local ext; ext=$(echo "${1##*.}" | tr '[:lower:]' '[:upper:]')
   for r in $RAW_EXTS; do [[ "$ext" == "$r" ]] && return 0; done
   return 1
 }
 
 should_skip_ext() {
-  local ext="${1##*.}"; ext="${ext^^}"
-  for s in $SKIP_EXTENSIONS; do [[ "$ext" == "${s^^}" ]] && return 0; done
+  local ext; ext=$(echo "${1##*.}" | tr '[:lower:]' '[:upper:]')
+  for s in $SKIP_EXTENSIONS; do [[ "$ext" == "$(echo "$s" | tr '[:lower:]' '[:upper:]')" ]] && return 0; done
   return 1
 }
 
