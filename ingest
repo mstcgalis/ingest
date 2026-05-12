@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ingest — photo ingest from SD card / USB volume
-# https://github.com/YOUR_USER/homebrew-tap
+# https://github.com/mstcgalis/ingest
 #
 # Folder structure: DEST_ROOT/YYYY/YYYY-MM-DD_Camera-Model/file.jpg
 #                                                          /RAW/file.CR3
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.3"
+VERSION="1.0.4"
 
 # ── platform ──────────────────────────────────────────────────────────────────
 
