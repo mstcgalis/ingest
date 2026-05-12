@@ -1,0 +1,41 @@
+# ~/.config/ingest/config
+# Sourced as bash by the ingest script.
+# All variables are optional — uncomment and edit what you need.
+
+# ── destination ───────────────────────────────────────────────────────────────
+
+DEST_ROOT="$HOME/Photos"
+
+# Subfolder for RAW files within each date+camera dir
+RAW_SUBDIR="RAW"
+
+# Character(s) between date and camera name in the directory name
+# Default produces: 2026-05-10_Canon-EOS-R5
+CAMERA_SEPARATOR="_"
+
+# ── file filtering ────────────────────────────────────────────────────────────
+
+# Extensions to silently skip (space-separated, case-insensitive)
+# THM = Canon thumbnail sidecar  |  LRV = GoPro low-res proxy
+SKIP_EXTENSIONS="THM LRV"
+
+# ── behaviour ─────────────────────────────────────────────────────────────────
+
+# Eject the SD card / camera volume after a clean ingest (no failures)
+EJECT_AFTER=false
+
+# ── Immich ────────────────────────────────────────────────────────────────────
+
+# Upload to Immich after copying. Also activatable with: ingest -u
+IMMICH_UPLOAD=false
+
+IMMICH_SERVER="http://YOUR_IMMICH_HOST:2283"
+IMMICH_API_KEY="your-api-key-here"
+
+# Optional: assign uploaded files to an album. Leave empty to skip.
+IMMICH_ALBUM=""
+
+# ── logging ───────────────────────────────────────────────────────────────────
+
+# Logs and the duplicate hash database live here
+LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ingest"

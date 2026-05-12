@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# ingest — photo ingest from SD card / USB volume
+# https://github.com/YOUR_USER/homebrew-tap
+#
+# Folder structure: DEST_ROOT/YYYY/YYYY-MM-DD_Camera-Model/file.jpg
+#                                                          /RAW/file.CR3
+#
+# Config:  ~/.config/ingest/config  (XDG_CONFIG_HOME honoured)
+# Logs:    ~/.local/share/ingest/
+# Hashes:  ~/.local/share/ingest/imported.sha256
+#
+# Dependencies: exiftool
+#               shasum  (macOS built-in)  |  sha256sum  (Linux coreutils)
+# Optional:     immich-cli  (npm i -g @immich/cli)
+#               udisksctl   (Linux eject, package: udisks2)
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# ── platform ──────────────────────────────────────────────────────────────────
+
+OS="$(uname -s)"
+case "$OS" in
+  Darwin) PLATFORM="macos" ;;
+  Linux)  PLATFORM="linux" ;;
+  *)      echo "ERROR: Unsupported platform: $OS" >&2; exit 1 ;;
+esac
+
+# ── defaults (overridden by config) ───────────────────────────────────────────
+
+DEST_ROOT="$HOME/Photos"
+RAW_SUBDIR="RAW"
+CAMERA_SEPARATOR="_"          # between date and camera name: 2026-05-10_Canon-EOS-R5
+IMMICH_UPLOAD=false
+IMMICH_SERVER=""
+IMMICH_API_KEY=""
+IMMICH_ALBUM=""
+LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ingest"
+DRY_RUN=false
+EJECT_AFTER=false
+SKIP_EXTENSIONS="THM LRV"    # space-separated, case-insensitive
+
+# RAW extensions → go into RAW_SUBDIR
+RAW_EXTS="ARW CR2 CR3 NEF NRW RAF ORF RW2 DNG PEF SRW X3F"
+
+# ── config file ───────────────────────────────────────────────────────────────
+
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ingest/config"
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# ── usage ─────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+Usage: ingest [OPTIONS] [SOURCE]
+
+  SOURCE   Path to SD card / USB volume / camera mount.
+           Auto-detected on macOS (/Volumes) and Linux (/media, /run/media).
+           Volume must contain a DCIM/ folder.
+
+Options:
+  -d PATH  Destination root (default: $DEST_ROOT)
+  -n       Dry run — show what would happen, copy nothing
+  -e       Eject source volume after a clean ingest
+  -u       Upload to Immich after copying
+  -h       Show this help
+
+Output structure:
+  \$DEST/YYYY/YYYY-MM-DD_Camera-Model/photo.jpg
+  \$DEST/YYYY/YYYY-MM-DD_Camera-Model/$RAW_SUBDIR/photo.CR3
+
+Config: $CONFIG_FILE
+EOF
+  exit 0
+}
+
+# ── CLI args ──────────────────────────────────────────────────────────────────
+
+SOURCE_PATH=""
+
+while getopts ":d:neuh" opt; do
+  case $opt in
+    d) DEST_ROOT="$OPTARG" ;;
+    n) DRY_RUN=true ;;
+    e) EJECT_AFTER=true ;;
+    u) IMMICH_UPLOAD=true ;;
+    h) usage ;;
+    *) echo "Unknown option: -$OPTARG" >&2; usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -gt 0 ]] && SOURCE_PATH="$1"
+
+# ── dependency checks ─────────────────────────────────────────────────────────
+
+need() {
+  command -v "$1" &>/dev/null && return 0
+  echo "ERROR: '$1' not found.  $2" >&2; exit 1
+}
+
+need exiftool "brew install exiftool  |  apt install libimage-exiftool-perl"
+
+if $IMMICH_UPLOAD; then
+  need immich "npm i -g @immich/cli"
+  [[ -z "$IMMICH_SERVER"  ]] && { echo "ERROR: IMMICH_SERVER not configured" >&2; exit 1; }
+  [[ -z "$IMMICH_API_KEY" ]] && { echo "ERROR: IMMICH_API_KEY not configured" >&2; exit 1; }
+fi
+
+# ── platform-specific functions ───────────────────────────────────────────────
+
+sha256_file() {
+  if [[ "$PLATFORM" == "macos" ]]; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    sha256sum "$1" | awk '{print $1}'
+  fi
+}
+
+file_mtime_ymd() {
+  if [[ "$PLATFORM" == "macos" ]]; then
+    date -r "$1" +%Y-%m-%d
+  else
+    date -d "@$(stat -c %Y "$1")" +%Y-%m-%d
+  fi
+}
+
+eject_volume() {
+  local path="$1"
+  if [[ "$PLATFORM" == "macos" ]]; then
+    diskutil eject "$path"
+  else
+    local dev
+    dev=$(findmnt -n -o SOURCE --target "$path" 2>/dev/null || true)
+    if [[ -n "$dev" ]]; then
+      udisksctl unmount -b "$dev" && udisksctl power-off -b "$dev" || true
+    else
+      umount "$path" || true
+    fi
+  fi
+}
+
+# ── auto-detect source volume ─────────────────────────────────────────────────
+
+detect_source() {
+  local candidates=()
+
+  if [[ "$PLATFORM" == "macos" ]]; then
+    local roots=("/Volumes")
+  else
+    local roots=()
+    [[ -d "/media/$USER"            ]] && roots+=("/media/$USER")
+    [[ -d "/run/media/$USER"        ]] && roots+=("/run/media/$USER")
+    [[ ${#roots[@]} -eq 0          ]] && roots+=("/media")
+  fi
+
+  for root in "${roots[@]}"; do
+    while IFS= read -r -d '' vol; do
+      local name; name=$(basename "$vol")
+      case "$name" in
+        "Macintosh HD"|"Preboot"|"Recovery"|"VM"|"Update") continue ;;
+      esac
+      [[ -d "$vol/DCIM" ]] && candidates+=("$vol")
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  done
+
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    echo "ERROR: No camera/SD volumes found (need DCIM/ folder)" >&2; exit 1
+  elif [[ ${#candidates[@]} -gt 1 ]]; then
+    echo "Multiple volumes found — pick one:"
+    select vol in "${candidates[@]}"; do
+      [[ -n "$vol" ]] && { SOURCE_PATH="$vol"; return; }
+    done
+  else
+    SOURCE_PATH="${candidates[0]}"
+    echo "Auto-detected: $SOURCE_PATH"
+  fi
+}
+
+[[ -z "$SOURCE_PATH" ]] && detect_source
+[[ ! -d "$SOURCE_PATH" ]] && { echo "ERROR: Source not found: $SOURCE_PATH" >&2; exit 1; }
+
+# ── logging ───────────────────────────────────────────────────────────────────
+
+mkdir -p "$LOG_DIR"
+HASH_DB="$LOG_DIR/imported.sha256"
+touch "$HASH_DB"
+
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+LOG_FILE="$LOG_DIR/ingest_${TIMESTAMP}.log"
+
+log() { echo "$*" | tee -a "$LOG_FILE"; }
+
+log "=== ingest $TIMESTAMP ==="
+log "Platform : $PLATFORM"
+log "Source   : $SOURCE_PATH"
+log "Dest     : $DEST_ROOT"
+$DRY_RUN && log "[DRY RUN — nothing will be written]"
+log ""
+
+# ── helper predicates ─────────────────────────────────────────────────────────
+
+is_raw() {
+  local ext="${1##*.}"; ext="${ext^^}"
+  for r in $RAW_EXTS; do [[ "$ext" == "$r" ]] && return 0; done
+  return 1
+}
+
+should_skip_ext() {
+  local ext="${1##*.}"; ext="${ext^^}"
+  for s in $SKIP_EXTENSIONS; do [[ "$ext" == "${s^^}" ]] && return 0; done
+  return 1
+}
+
+already_imported() { grep -qF "$1" "$HASH_DB" 2>/dev/null; }
+record_import()    { printf '%s  %s\n' "$1" "$2" >> "$HASH_DB"; }
+
+# Sanitize camera model string for use as a directory name:
+#   spaces/slashes/colons → hyphen, strip unsafe chars, collapse hyphens
+sanitize_camera() {
+  echo "$1" \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+    | sed 's|[[:space:]/:\\|]\+|-|g' \
+    | sed 's/[^A-Za-z0-9._-]//g' \
+    | sed 's/-\{2,\}/-/g'
+}
+
+# ── counters ──────────────────────────────────────────────────────────────────
+
+count_copied=0
+count_skipped=0
+count_failed=0
+
+# ── main loop ─────────────────────────────────────────────────────────────────
+
+log "Scanning $SOURCE_PATH/DCIM ..."
+log ""
+
+while IFS= read -r -d '' src_file; do
+  filename=$(basename "$src_file")
+
+  # skip unwanted extensions
+  if should_skip_ext "$filename"; then
+    log "SKIP-EXT  $filename"
+    (( count_skipped++ )) || true
+    continue
+  fi
+
+  # ── EXIF date ──────────────────────────────────────────────────────────────
+
+  exif_date=$(exiftool -d "%Y-%m-%d" -DateTimeOriginal -S -s "$src_file" 2>/dev/null \
+    | tr -d '[:space:]' || true)
+
+  if [[ -z "$exif_date" || "$exif_date" == "0000-00-00" ]]; then
+    exif_date=$(file_mtime_ymd "$src_file" 2>/dev/null || date +%Y-%m-%d)
+    log "WARN      $filename — no EXIF date, using mtime ($exif_date)"
+  fi
+
+  year="${exif_date%%-*}"
+
+  # ── camera model ───────────────────────────────────────────────────────────
+
+  camera_raw=$(exiftool -Model -S -s "$src_file" 2>/dev/null | xargs || true)
+
+  if [[ -z "$camera_raw" ]]; then
+    camera_clean="unknown"
+  else
+    camera_clean=$(sanitize_camera "$camera_raw")
+    [[ -z "$camera_clean" ]] && camera_clean="unknown"
+  fi
+
+  # ── build destination path ─────────────────────────────────────────────────
+
+  date_cam="${exif_date}${CAMERA_SEPARATOR}${camera_clean}"
+
+  if is_raw "$filename"; then
+    dest_dir="$DEST_ROOT/$year/$date_cam/$RAW_SUBDIR"
+  else
+    dest_dir="$DEST_ROOT/$year/$date_cam"
+  fi
+
+  dest_file="$dest_dir/$filename"
+
+  # ── duplicate check (SHA256 against persistent db) ────────────────────────
+
+  file_hash=$(sha256_file "$src_file")
+
+  if already_imported "$file_hash"; then
+    log "SKIP-DUP  $filename  [$file_hash]"
+    (( count_skipped++ )) || true
+    continue
+  fi
+
+  # ── filename collision (same name, different content) ──────────────────────
+
+  if [[ -f "$dest_file" ]]; then
+    local_base="${filename%.*}"
+    local_ext="${filename##*.}"
+    dest_file="$dest_dir/${local_base}_${file_hash:0:8}.${local_ext}"
+  fi
+
+  # ── copy (or dry-run report) ───────────────────────────────────────────────
+
+  if $DRY_RUN; then
+    log "DRY       $src_file"
+    log "       →  $dest_file"
+    (( count_copied++ )) || true
+    continue
+  fi
+
+  mkdir -p "$dest_dir"
+
+  if cp "$src_file" "$dest_file"; then
+    record_import "$file_hash" "$dest_file"
+    log "COPY      $filename  →  $dest_file"
+    (( count_copied++ )) || true
+  else
+    log "FAIL      $src_file"
+    (( count_failed++ )) || true
+  fi
+
+done < <(find "$SOURCE_PATH/DCIM" -type f -print0 2>/dev/null)
+
+# ── summary ───────────────────────────────────────────────────────────────────
+
+log ""
+log "────────────────────────────────────────"
+log "Copied  : $count_copied"
+log "Skipped : $count_skipped  (duplicates + filtered extensions)"
+log "Failed  : $count_failed"
+log "Log     : $LOG_FILE"
+log "────────────────────────────────────────"
+
+# ── Immich upload ─────────────────────────────────────────────────────────────
+
+if $IMMICH_UPLOAD && ! $DRY_RUN && [[ $count_copied -gt 0 ]]; then
+  log ""
+  log "Uploading to Immich ($IMMICH_SERVER) ..."
+
+  immich_args=(
+    upload
+    --server  "$IMMICH_SERVER"
+    --key     "$IMMICH_API_KEY"
+    --recursive
+  )
+  [[ -n "$IMMICH_ALBUM" ]] && immich_args+=(--album "$IMMICH_ALBUM")
+  immich_args+=("$DEST_ROOT")
+
+  if immich "${immich_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+    log "Immich upload complete."
+  else
+    log "ERROR: Immich upload failed — files are safely on disk."
+    exit 1
+  fi
+fi
+
+# ── eject ─────────────────────────────────────────────────────────────────────
+
+if $EJECT_AFTER && ! $DRY_RUN && [[ $count_failed -eq 0 ]]; then
+  log ""
+  log "Ejecting $SOURCE_PATH ..."
+  if eject_volume "$SOURCE_PATH"; then
+    log "Ejected."
+  else
+    log "WARN: eject failed — remove manually."
+  fi
+fi
