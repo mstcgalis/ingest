@@ -106,7 +106,3 @@ Dates come from EXIF (`DateTimeOriginal`), falling back to the file's modificati
 ## Logs
 
 Each run writes a log to `~/.local/share/ingest/ingest_YYYYMMDD_HHMMSS.log`.
-
-## License
-
-MIT
